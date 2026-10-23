@@ -10,9 +10,14 @@ const UA_LIST = [
   "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36"
 ];
 
+// সম্ভাব্য backend host। প্রথমটা verified; বাকিগুলো fallback।
+// discovery ফিচার নতুন host পেলে নিজে যোগ করে নেবে।
+const DEFAULT_BACKEND_HOSTS = [
+  "https://awh5tmpjds.us-east-1.awsapprunner.com"
+];
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** একবার বানানো অ্যাকাউন্ট বারবার ব্যবহার করে Firebase signup কমায় */
 export class AccountPool {
   constructor(max = 40) {
     this.max = max;
@@ -20,10 +25,7 @@ export class AccountPool {
   }
   take() {
     const acc = this.accounts.find((a) => a.credits > 0);
-    if (acc) {
-      acc.credits -= 1;
-      return acc;
-    }
+    if (acc) { acc.credits -= 1; return acc; }
     return null;
   }
   put(acc) {
@@ -42,24 +44,26 @@ export class AccountPool {
 export default class UndressAI {
   constructor(opts = {}) {
     this.apiKey = opts.apiKey || "AIzaSyD_omM03MyUQdBNAQ3lW0RzjRS5x29GDnM";
-    this.backendHosts = opts.backendHosts || [
-      "https://awh5tmpjds.us-east-1.awsapprunner.com"
-    ];
+    this.backendHosts = [...(opts.backendHosts || DEFAULT_BACKEND_HOSTS)];
     this.activeBackend = null;
-    this.maskHost = "https://mkv2.undressaitools.net";
-    this.genHost = "https://igv2.undressaitools.net";
+    this.maskHost = opts.maskHost || "https://mkv2.undressaitools.net";
+    this.genHost = opts.genHost || "https://igv2.undressaitools.net";
+    this.siteOrigin = "https://undressaitools.net";
     this.authUrl = "https://identitytoolkit.googleapis.com/v1/accounts";
     this.basicAuth = "Basic cG9ybmdlbjpwb3JuZ2Vu";
-    this.timeout = opts.timeout || 150000;
+    this.timeout = opts.timeout || 60000;
     this.pool = opts.pool || null;
-    this.debug = opts.debug || false;
+    this.debug = opts.debug || process.env.DEBUG === "1";
+    this.lastGuestError = null;
+    this.discoveredHosts = [];
     this.ua = UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
+
     this.commonHeaders = {
       "User-Agent": this.ua,
       Accept: "application/json, text/plain, */*",
       "Accept-Language": "id-ID",
-      Origin: "https://undressaitools.net",
-      Referer: "https://undressaitools.net/",
+      Origin: this.siteOrigin,
+      Referer: `${this.siteOrigin}/`,
       "sec-ch-ua": '"Chromium";v="127", "Not)A;Brand";v="99"',
       "sec-ch-ua-mobile": "?1",
       "sec-ch-ua-platform": '"Android"',
@@ -73,22 +77,17 @@ export default class UndressAI {
     if (this.debug) console.log(`[UndressAI] ${new Date().toISOString()} -> ${msg}`);
   }
 
-  randHex(len) {
-    return crypto.randomBytes(len).toString("hex");
-  }
-  md5(str) {
-    return crypto.createHash("md5").update(str).digest("hex");
-  }
+  randHex(len) { return crypto.randomBytes(len).toString("hex"); }
+  md5(str) { return crypto.createHash("md5").update(str).digest("hex"); }
   genBaseFingerprint() {
-    let result = "";
-    for (let i = 0; i < 16; i++) result += Math.floor(Math.random() * 10);
-    return result;
+    let s = "";
+    for (let i = 0; i < 16; i++) s += Math.floor(Math.random() * 10);
+    return s;
   }
 
-  /** timeout সহ fetch */
-  async req(url, options = {}) {
+  async req(url, options = {}, timeoutMs) {
     const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), this.timeout);
+    const t = setTimeout(() => controller.abort(), timeoutMs || this.timeout);
     try {
       return await fetch(url, { ...options, signal: controller.signal });
     } finally {
@@ -96,45 +95,105 @@ export default class UndressAI {
     }
   }
 
-  /** exponential backoff সহ retry */
   async retry(fn, times = 3, label = "task") {
     let lastErr;
     for (let i = 0; i < times; i++) {
-      try {
-        return await fn();
-      } catch (e) {
+      try { return await fn(); }
+      catch (e) {
         lastErr = e;
         this.log(`retry ${i + 1}/${times} [${label}] -> ${e.message}`);
-        await sleep(400 * (i + 1) + Math.floor(Math.random() * 300));
+        await sleep(300 * (i + 1) + Math.floor(Math.random() * 250));
       }
     }
     throw lastErr;
   }
 
-  async stepGuest(baseFp) {
-    return this.retry(async () => {
-      for (const host of this.backendHosts) {
+  /** সাইটের JS bundle থেকে live backend host খুঁজে বের করে (self-healing) */
+  async discoverBackendHosts() {
+    const found = new Set();
+    const re = /https:\/\/[a-z0-9-]+\.(?:us|eu|ap|sa|ca|me|af)-[a-z]+-\d\.awsapprunner\.com/gi;
+    const scan = (text) => {
+      let m;
+      while ((m = re.exec(text))) found.add(m[0]);
+    };
+    try {
+      const r = await this.req(this.siteOrigin + "/", {
+        headers: { "User-Agent": this.ua }
+      }, 12000);
+      const html = await r.text();
+      scan(html);
+
+      const scripts = [...html.matchAll(/(?:src|href)="([^"]+\.js[^"]*)"/g)]
+        .map((m) => m[1])
+        .slice(0, 15);
+
+      await Promise.all(scripts.map(async (s) => {
         try {
-          const res = await this.req(`${host}/guest?fingerprint=${baseFp}`, {
-            method: "GET",
-            headers: {
-              ...this.commonHeaders,
-              Authorization: this.basicAuth,
-              Accept: "*/*"
-            }
-          });
-          if (res.ok) {
-            const text = await res.text();
-            this.activeBackend = host;
-            this.log(`guest ok @ ${host}`);
-            return text;
-          }
-        } catch (e) {
-          this.log(`guest fail @ ${host}: ${e.message}`);
+          const u = s.startsWith("http") ? s : new URL(s, this.siteOrigin + "/").href;
+          const rr = await this.req(u, { headers: { "User-Agent": this.ua } }, 12000);
+          scan(await rr.text());
+        } catch { /* ignore */ }
+      }));
+    } catch (e) {
+      this.log(`discovery failed: ${e.message}`);
+    }
+    this.discoveredHosts = [...found];
+    this.log(`discovered hosts: ${this.discoveredHosts.join(", ") || "(none)"}`);
+    return this.discoveredHosts;
+  }
+
+  async tryGuest(hosts, mode, baseFp) {
+    for (const host of hosts) {
+      try {
+        const headers = mode === "minimal"
+          ? { "User-Agent": this.ua, Authorization: this.basicAuth, Accept: "*/*" }
+          : { ...this.commonHeaders, Authorization: this.basicAuth, Accept: "*/*" };
+
+        const res = await this.req(`${host}/guest?fingerprint=${baseFp}`,
+          { method: "GET", headers }, 15000);
+
+        if (res.ok) {
+          const text = (await res.text()).trim();
+          if (!text) { this.lastGuestError = `${host} -> 200 কিন্তু খালি body`; continue; }
+          this.activeBackend = host;
+          if (!this.backendHosts.includes(host)) this.backendHosts.unshift(host);
+          this.log(`guest ok @ ${host} (${mode})`);
+          return text;
         }
+
+        const body = (await res.text().catch(() => "")).slice(0, 160).replace(/\s+/g, " ");
+        this.lastGuestError = `${host} [${mode}] -> HTTP ${res.status} ${body}`;
+        this.log(this.lastGuestError);
+      } catch (e) {
+        this.lastGuestError = `${host} [${mode}] -> ${e.name}: ${e.message}`;
+        this.log(this.lastGuestError);
       }
-      throw new Error("Backend Init Failed");
-    }, 3, "guest");
+    }
+    return null;
+  }
+
+  async stepGuest(baseFp) {
+    // ১. পরিচিত host, পূর্ণ header
+    let id = await this.tryGuest(this.backendHosts, "full", baseFp);
+    if (id) return id;
+
+    // ২. পরিচিত host, minimal header (WAF-এ আটকালে কাজে দেয়)
+    id = await this.tryGuest(this.backendHosts, "minimal", baseFp);
+    if (id) return id;
+
+    // ৩. live discovery
+    const hosts = await this.discoverBackendHosts();
+    const fresh = hosts.filter((h) => !this.backendHosts.includes(h));
+    if (fresh.length) {
+      id = await this.tryGuest(fresh, "full", baseFp);
+      if (id) return id;
+      id = await this.tryGuest(fresh, "minimal", baseFp);
+      if (id) return id;
+    }
+
+    throw new Error(
+      `Backend Init Failed :: ${this.lastGuestError || "কোনো host reachable নয়"}`
+    );
   }
 
   async stepMask(guestId, b64) {
@@ -156,7 +215,7 @@ export default class UndressAI {
         country: "US"
       })
     });
-    if (!res.ok) throw new Error(`Mask Error: ${res.status}`);
+    if (!res.ok) throw new Error(`Mask Error: HTTP ${res.status}`);
     const data = await res.json();
     return { tid: data.task_id, mask: data.mask_base64, orig: data.image_base64 };
   }
@@ -180,7 +239,10 @@ export default class UndressAI {
         clientType: "CLIENT_TYPE_WEB"
       })
     });
-    if (!res.ok) throw new Error(`Auth Error: ${res.status}`);
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      throw new Error(`Auth Error: HTTP ${res.status} ${t.slice(0, 160)}`);
+    }
     const data = await res.json();
     this.req(`${this.authUrl}:lookup?key=${this.apiKey}`, {
       method: "POST",
@@ -213,8 +275,8 @@ export default class UndressAI {
       })
     });
     if (!res.ok) {
-      const txt = await res.text();
-      throw new Error(`Reg Error ${res.status}: ${txt}`);
+      const txt = await res.text().catch(() => "");
+      throw new Error(`Reg Error HTTP ${res.status}: ${txt.slice(0, 200)}`);
     }
     const data = await res.json();
     return data.user_id;
@@ -222,17 +284,14 @@ export default class UndressAI {
 
   async stepCheckBalance(userId) {
     try {
-      const res = await this.req(
-        `${this.activeBackend}/balance?user_id=${userId}`,
-        {
-          method: "GET",
-          headers: {
-            ...this.commonHeaders,
-            Authorization: this.basicAuth,
-            "X-Client": "fantasy-new"
-          }
+      const res = await this.req(`${this.activeBackend}/balance?user_id=${userId}`, {
+        method: "GET",
+        headers: {
+          ...this.commonHeaders,
+          Authorization: this.basicAuth,
+          "X-Client": "fantasy-new"
         }
-      );
+      });
       const data = await res.json();
       this.req(`${this.activeBackend}/users?user_id=${userId}`, {
         method: "GET",
@@ -273,8 +332,8 @@ export default class UndressAI {
         watermark: "ai1",
         quality: p.quality || "low"
       })
-    });
-    if (!res.ok) throw new Error(`Exec Error: ${res.status}`);
+    }, 120000);
+    if (!res.ok) throw new Error(`Exec Error: HTTP ${res.status}`);
     const data = await res.json();
     if (data.code === 6100) return data.data;
     throw new Error(data.msg || "Generation Failed");
@@ -284,17 +343,15 @@ export default class UndressAI {
     if (Buffer.isBuffer(input)) return input.toString("base64");
     if (typeof input === "string") {
       if (input.startsWith("http")) {
-        const r = await this.req(input);
+        const r = await this.req(input, {}, 30000);
         if (!r.ok) throw new Error("Failed to fetch image");
-        const ab = await r.arrayBuffer();
-        return Buffer.from(ab).toString("base64");
+        return Buffer.from(await r.arrayBuffer()).toString("base64");
       }
       return input.replace(/^data:image\/\w+;base64,/, "");
     }
     throw new Error("Invalid Image");
   }
 
-  /** pool থেকে অ্যাকাউন্ট নেয়, না থাকলে নতুন বানায় */
   async getAccount(baseFp) {
     if (this.pool) {
       const pooled = this.pool.take();
@@ -312,7 +369,11 @@ export default class UndressAI {
         const credits = await this.stepCheckBalance(backendId);
         this.log(`new account credits=${credits}`);
         if (credits < 0) continue;
-        const acc = { uid, email, backendId, credits: Math.max(credits - 1, 0), backend: this.activeBackend };
+        const acc = {
+          uid, email, backendId,
+          credits: Math.max(credits - 1, 0),
+          backend: this.activeBackend
+        };
         if (this.pool) this.pool.put(acc);
         return acc;
       } catch (e) {
@@ -330,8 +391,8 @@ export default class UndressAI {
     const maskData = await this.stepMask(guestId, b64);
 
     let account = await this.getAccount(baseFp);
+    let finalB64 = null;
 
-    let finalB64;
     for (let i = 0; i < 3; i++) {
       try {
         finalB64 = await this.stepExec({
@@ -349,8 +410,75 @@ export default class UndressAI {
       }
     }
     if (!finalB64) throw new Error("Generation Failed after retries");
+    return Buffer.from(finalB64.replace(/^data:image\/\w+;base64,/, ""), "base64");
+  }
 
-    const clean = finalB64.replace(/^data:image\/\w+;base64,/, "");
-    return Buffer.from(clean, "base64");
+  /** প্রতিটি ধাপ আলাদা করে টেস্ট করে রিপোর্ট দেয় */
+  async diagnose({ imageUrl, imageBuffer } = {}) {
+    const report = {
+      ok: false,
+      vercel: !!process.env.VERCEL,
+      knownHosts: [...this.backendHosts],
+      steps: {}
+    };
+    const baseFp = this.genBaseFingerprint();
+
+    try {
+      report.steps.discovery = {
+        ok: true,
+        hosts: await this.discoverBackendHosts()
+      };
+    } catch (e) {
+      report.steps.discovery = { ok: false, error: e.message };
+    }
+
+    let guestId;
+    try {
+      guestId = await this.stepGuest(baseFp);
+      report.steps.guest = { ok: true, host: this.activeBackend, id: guestId };
+    } catch (e) {
+      report.steps.guest = {
+        ok: false,
+        error: e.message,
+        lastError: this.lastGuestError
+      };
+      return report;
+    }
+
+    let b64 = null;
+    if (imageUrl || imageBuffer) {
+      try {
+        b64 = await this.processImg(imageBuffer || imageUrl);
+        report.steps.image = { ok: true, bytes: b64.length };
+      } catch (e) {
+        report.steps.image = { ok: false, error: e.message };
+      }
+    }
+
+    if (b64) {
+      try {
+        const m = await this.stepMask(guestId, b64);
+        report.steps.mask = { ok: true, taskId: m.tid, maskLen: m.mask?.length };
+      } catch (e) {
+        report.steps.mask = { ok: false, error: e.message };
+      }
+    }
+
+    try {
+      const { uid, email } = await this.stepFirebaseAuth();
+      report.steps.firebase = { ok: true, uid };
+      try {
+        const backendId = await this.stepBackendReg(uid, email, baseFp);
+        const bal = await this.stepCheckBalance(backendId);
+        report.steps.backend = { ok: true, backendId, credits: bal };
+        report.ok = true;
+      } catch (e) {
+        report.steps.backend = { ok: false, error: e.message };
+      }
+    } catch (e) {
+      report.steps.firebase = { ok: false, error: e.message };
+    }
+
+    return report;
   }
 }
