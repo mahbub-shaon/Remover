@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
-import fs from "fs/promises";
+import fs from "fs";
+import fsp from "fs/promises";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
@@ -8,16 +9,31 @@ import fetch from "node-fetch";
 import UndressAI, { AccountPool } from "./undressai.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const IS_VERCEL = !!process.env.VERCEL;
+
+// Vercel-এ শুধু /tmp লেখা যায়
+const ROOT = IS_VERCEL ? "/tmp" : path.join(__dirname, "public");
+const ORIG_DIR = path.join(ROOT, "originals");
+const RES_DIR = path.join(ROOT, "results");
+
+// top-level await এড়াতে lazy mkdir (নিরাপদ)
+let dirsReady = false;
+function ensureDirs() {
+  if (dirsReady) return;
+  for (const d of [ORIG_DIR, RES_DIR]) {
+    try {
+      fs.mkdirSync(d, { recursive: true });
+    } catch (e) {
+      console.error("mkdir failed:", d, e.message);
+    }
+  }
+  dirsReady = true;
+}
+
 const PORT = process.env.PORT || 3000;
 const OWNER = process.env.API_OWNER || "example";
 const CONCURRENCY = Number(process.env.CONCURRENCY || 5);
 
-const ORIG_DIR = path.join(__dirname, "public", "originals");
-const RES_DIR = path.join(__dirname, "public", "results");
-await fs.mkdir(ORIG_DIR, { recursive: true });
-await fs.mkdir(RES_DIR, { recursive: true });
-
-// সার্ভার লাইফটাইমে শেয়ারড পুল — Firebase signup কমায়
 const pool = new AccountPool(50);
 
 class Semaphore {
@@ -38,11 +54,18 @@ const sem = new Semaphore(CONCURRENCY);
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
-app.use("/files", express.static(path.join(__dirname, "public")));
+
+function baseUrl(req) {
+  const proto = (req.headers["x-forwarded-proto"] || req.protocol || "https")
+    .split(",")[0].trim();
+  const host = req.headers["x-forwarded-host"] || req.get("host");
+  return `${proto}://${host}`;
+}
 
 async function handle(req, res) {
   const imgurl =
     req.query.imgurl || req.query.imageUrl || req.query.url || req.body?.imgurl;
+
   if (!imgurl) {
     return res.status(400).json({
       success: false,
@@ -51,28 +74,27 @@ async function handle(req, res) {
     });
   }
 
+  ensureDirs();
   const id = crypto.randomBytes(8).toString("hex");
   const started = Date.now();
 
   await sem.acquire();
   try {
-    // original image নামিয়ে সেভ করা
     const imgRes = await fetch(imgurl);
     if (!imgRes.ok) throw new Error(`Gagal mengambil gambar (${imgRes.status})`);
     const buf = Buffer.from(await imgRes.arrayBuffer());
     const ct = imgRes.headers.get("content-type") || "image/jpeg";
     const ext = ct.includes("png") ? "png" : ct.includes("webp") ? "webp" : "jpg";
     const origName = `orig_${id}.${ext}`;
-    await fs.writeFile(path.join(ORIG_DIR, origName), buf);
+    await fsp.writeFile(path.join(ORIG_DIR, origName), buf);
 
-    // প্রসেস
     const api = new UndressAI({ pool });
     const result = await api.generate({ imageBuffer: buf });
 
     const resName = `result_${id}.png`;
-    await fs.writeFile(path.join(RES_DIR, resName), result);
+    await fsp.writeFile(path.join(RES_DIR, resName), result);
 
-    const base = `${req.protocol}://${req.get("host")}`;
+    const base = baseUrl(req);
     return res.json({
       success: true,
       api_owner: OWNER,
@@ -94,16 +116,56 @@ async function handle(req, res) {
 app.get("/api/cloth-remove", handle);
 app.post("/api/cloth-remove", handle);
 
-app.get("/", (req, res) => {
-  res.json({
-    name: "Cloth Remove API",
-    api_owner: OWNER,
-    endpoint: "/api/cloth-remove?imgurl={image_url}",
-    pool: pool.stats()
-  });
+// /tmp থেকে ফাইল সার্ভ করা (express.static এর বদলে)
+app.get("/files/:type/:name", (req, res) => {
+  const dir = req.params.type === "results" ? RES_DIR : ORIG_DIR;
+  const file = path.join(dir, path.basename(req.params.name));
+  if (!fs.existsSync(file)) {
+    return res.status(404).json({ success: false, error: "File not found" });
+  }
+  res.sendFile(file);
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ Cloth Remove API jalan di http://localhost:${PORT}`);
-  console.log(`   GET /api/cloth-remove?imgurl=<url>`);
+// হোমপেজে ছোট টেস্ট UI
+app.get("/", (req, res) => {
+  res.type("html").send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Cloth Remove API</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+ body{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;background:#0d1117;color:#e6edf3}
+ input,button{font-size:16px;padding:10px;border-radius:8px;border:1px solid #30363d;width:100%;box-sizing:border-box}
+ button{margin-top:10px;background:#238636;color:#fff;border:none;cursor:pointer}
+ img{max-width:100%;border-radius:10px;margin-top:12px;border:1px solid #30363d}
+ .row{display:flex;gap:12px;flex-wrap:wrap}.col{flex:1;min-width:220px}
+ small{color:#8b949e}
+</style></head><body>
+<h2>Cloth Remove API</h2>
+<small>api_owner: ${OWNER}</small>
+<p><input id="u" placeholder="Image URL paste koro..." /></p>
+<button onclick="go()">Process</button>
+<div id="out"></div>
+<script>
+async function go(){
+ const u=document.getElementById('u').value.trim();
+ const out=document.getElementById('out');
+ if(!u)return;
+ out.innerHTML='<p>Processing... (20-60s)</p>';
+ try{
+  const r=await fetch('/api/cloth-remove?imgurl='+encodeURIComponent(u));
+  const j=await r.json();
+  if(!j.success){out.innerHTML='<pre>'+JSON.stringify(j,null,2)+'</pre>';return;}
+  out.innerHTML='<div class="row"><div class="col"><b>Original</b><img src="'+j.original_image+'"></div>'+
+                '<div class="col"><b>Result</b><img src="'+j.result_image+'"></div></div>';
+ }catch(e){out.innerHTML='Error: '+e.message;}
+}
+</script></body></html>`);
 });
+
+export default app;
+
+// লোকালে listen; Vercel-এ handler হিসেবে export হয়
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`API jalan di http://localhost:${PORT}`);
+  });
+}
