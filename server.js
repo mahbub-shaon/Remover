@@ -132,11 +132,28 @@ app.get("/api/debug", async (req, res) => {
     return res.json({ api_owner: OWNER, ...report });
   } catch (e) {
     console.error("DEBUG ERROR:", e);
-    return res.status(500).json({
+    return res.status(500).json({ api_owner: OWNER, ok: false, error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/*  PROBE — সব candidate host টেস্ট করে দেখায় কোনটা জীবিত              */
+/* ------------------------------------------------------------------ */
+
+app.get("/api/probe", async (req, res) => {
+  try {
+    const api = new UndressAI({ debug: true });
+    const candidates = await api.collectCandidateOrigins();
+    const results = await api.mapLimit(candidates, 10, (o) => api.probeGuest(o, 8000));
+    return res.json({
       api_owner: OWNER,
-      ok: false,
-      error: e.message
+      candidateCount: candidates.length,
+      alive: results.filter((r) => r && r.ok).map((r) => r.origin),
+      results
     });
+  } catch (e) {
+    console.error("PROBE ERROR:", e);
+    return res.status(500).json({ api_owner: OWNER, ok: false, error: e.message });
   }
 });
 
@@ -180,10 +197,11 @@ app.get("/", (req, res) => {
  a{color:#58a6ff}
 </style></head><body>
 <h2>Cloth Remove API</h2>
-<small>api_owner: ${OWNER} &nbsp;|&nbsp; <a href="/api/debug">/api/debug</a> &nbsp;|&nbsp; <a href="/api/health">/api/health</a></small>
+<small>api_owner: ${OWNER} &nbsp;|&nbsp; <a href="/api/health">/api/health</a> &nbsp;|&nbsp; <a href="/api/debug">/api/debug</a> &nbsp;|&nbsp; <a href="/api/probe">/api/probe</a></small>
 <p><input id="u" placeholder="Image URL paste koro..." /></p>
 <button onclick="go()">Process</button>
 <button class="dbg" onclick="dbg()">Run Debug</button>
+<button class="dbg" onclick="prb()">Run Probe</button>
 <div id="out"></div>
 <script>
 async function go(){
@@ -205,8 +223,15 @@ async function dbg(){
  out.innerHTML='<p>Debug running...</p>';
  try{
   const r=await fetch('/api/debug'+(u?'?imgurl='+encodeURIComponent(u):''));
-  const j=await r.json();
-  out.innerHTML='<pre>'+JSON.stringify(j,null,2)+'</pre>';
+  out.innerHTML='<pre>'+JSON.stringify(await r.json(),null,2)+'</pre>';
+ }catch(e){out.innerHTML='Error: '+e.message;}
+}
+async function prb(){
+ const out=document.getElementById('out');
+ out.innerHTML='<p>Probing hosts...</p>';
+ try{
+  const r=await fetch('/api/probe');
+  out.innerHTML='<pre>'+JSON.stringify(await r.json(),null,2)+'</pre>';
  }catch(e){out.innerHTML='Error: '+e.message;}
 }
 </script></body></html>`);
